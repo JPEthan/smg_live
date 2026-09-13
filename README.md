@@ -1,59 +1,116 @@
-# SMG 网页直播观看增强
+# SMG 网页直播观看增强（社区修复版）
 
-在浏览器端为 SMG 视频直播页面提供更顺畅的观看体验，并对部分浏览器环境做兼容性优化。
+这是 [`Popukok/smg_live`](https://github.com/Popukok/smg_live) 的社区修复版本，面向看看新闻的 SMG 电视直播与节目回看页面。
 
-# 说明
+本 Fork 保留原项目的播放器增强、节目回看、移动端和全屏适配逻辑，并补充了跨域请求兼容、接口重新签名、WAF 非 JSON 响应识别及回看 URL 拼接修复。
 
-26.08.21 ---> 去掉了接口返回M3U8地址，可能出于业务需求，保留体育新闻回看。
+> 本项目不会修改服务端权限，也不能绕过服务端 WAF、地区限制、账号权限或媒体 DRM。请仅在服务条款和内容授权允许的范围内使用。
 
-26.09.08 ---> 地址由火山（volc-stream）改为腾讯（tencent-vods），回看（timeshift）和直播（token）改为两套路径，封堵升级测试（有概率）。
+## 安装
 
-26.09.09 ---> 已恢复火山源（volc-stream），后续是否彻底切换腾讯源（tencent-vods），未知，仅做记录。
+1. 安装 [Tampermonkey](https://www.tampermonkey.net/)。
+2. 点击安装社区修复版：
 
-# 安装
+   [安装 `smg_fivestar.user.js`](https://raw.githubusercontent.com/JPEthan/smg_live/main/smg_fivestar.user.js)
 
-1. 浏览器安装 [Tampermonkey](https://tampermonkey.net/) 扩展（**推荐**）
-2. 点击下方链接安装脚本
+3. 打开 [SMG 直播页面](https://live.kankanews.com/huikan?id=10)。
+4. 如果曾安装原版或旧修复版，请确保 Tampermonkey 中只启用一份同名脚本，然后完全关闭并重新打开直播页面。
 
-| 正式版 (GitHub 源)                                                                           |
-|---------------------------------------------------------------------------------------------|
-| [安装](https://raw.githubusercontent.com/Popukok/smg_live/refs/heads/main/smg_fivestar.user.js)  |
+## 0.21.1 修复内容
 
-3. 打开 [SMG 直播页面](https://live.kankanews.com/huikan?id=10)，选择频道即可观看
+### KAPI 跨域请求桥
 
-# 兼容性
+页面发往 `https://kapi.kankanews.com` 的 `XMLHttpRequest` 和 `fetch` 请求可通过 Tampermonkey 的 `GM_xmlhttpRequest` 发送，避免浏览器在 CORS 预检阶段直接阻止请求。
 
-支持**最新版** Chrome、Firefox、Safari，脚本管理器推荐使用 [Tampermonkey](https://tampermonkey.net/)。
+桥接范围严格限制为 `kapi.kankanews.com`，不会代理其他站点。
 
-> ⚠️ 由于两款插件存在技术差异，基于 Tampermonkey（油猴）开发的脚本，在 Violentmonkey（暴力猴）上可能存在兼容性问题，**建议使用油猴插件**。
+### 请求重新签名
 
-### Safari（macOS / iOS）
+对 KAPI GET 请求重新生成客户端所需的：
 
-- **macOS Safari**：使用 [Tampermonkey](https://tampermonkey.net/) 或免费的 [Userscripts App](https://apps.apple.com/app/userscripts/id1463198887) 加载脚本
-- **iOS / iPadOS Safari**（需 iOS 15+）：安装 [Userscripts App](https://apps.apple.com/app/userscripts/id1463198887) 或 Tampermonkey，在「设置 → Safari → 扩展」中启用并允许访问 `kankanews.com`，导入脚本即可
-- iPhone 全屏使用 iOS 原生视频全屏；CSS 全屏已适配动态视口（dvh/dvw）与安全区域（刘海 / Home 指示条）
+- `platform`
+- `version`
+- `nonce`
+- `timestamp`
+- `Api-Version`
+- `sign`
+- `M-Uuid`
 
-> ⚠️ 若自行修改过脚本，建议在管理器中**关闭自动更新**，避免被上游版本覆盖本地改动。
+同时补充正常的 `Accept`、`User-Agent`、`Origin` 和 `Referer` 请求信息，减少因旧签名、缺失请求头或来源信息不完整造成的接口拒绝。
 
-# 移动端
+### WAF 响应识别
 
-在支持用户脚本的移动浏览器中均可使用（Android 端此类浏览器通常内置 Violentmonkey，请一并留意上方兼容性提示）：
+接口被服务器 WAF 拦截时，正文通常是以 `<!DOCTYPE html>` 开头的 HTML，而不是 JSON。脚本现在会先检查响应类型，不再对 WAF 页面盲目执行 `JSON.parse()`。
 
-- **Kiwi Browser**、**Chrome**、**Edge**：安装体验与桌面端最接近
-- **Firefox for Android**：支持扩展与脚本
-- **X浏览器**：轻量、支持用户脚本
-- **iPhone / iPad**：直接使用 Safari + Userscripts App 或 Tampermonkey，无需更换浏览器
+控制台会输出不含签名和播放令牌的诊断信息：
 
-# 苹果设备使用说明
+```text
+[SMGTV] 接口返回非 JSON，可能被 WAF 拦截
+```
 
-**macOS Safari**（二选一）：
-- Userscripts（免费开源，推荐）：App Store 安装 → Safari 设置 → 扩展中启用 → 打开 Userscripts App 设定脚本目录 → 将 `smg_fivestar.user.js` 放入该目录
-- Tampermonkey：App Store 安装 → Safari 设置 → 扩展中启用并允许访问网站 → 导入脚本
+其中包含接口路径、HTTP 状态码、内容类型和最终地址。
 
-**iPhone / iPad（需 iOS 15+）**：
-1. App Store 安装 Userscripts（免费）或 Tampermonkey
-2. 设置 → Safari → 扩展 → 启用并允许访问 `kankanews.com`
-3. 将 `smg_fivestar.user.js` 放入 Userscripts 的脚本目录（或经分享菜单导入）
-4. 打开 [SMG 直播页面](https://live.kankanews.com/huikan?id=10) 选择频道即可
+如果状态仍为 `403`，说明请求已经到达服务器，但被服务端安全策略拒绝。这种情况无法仅靠用户脚本修复，应确认该服务是否在当前地区和网络正式可用，或将 WAF 页面上的请求 UUID 提供给网站运维人员。
 
-本仓库内容仅供学习交流。
+### 回看地址拼接
+
+修复桌面端回看地址固定使用 `&start=` 的问题。现在会根据基础 URL 是否已有查询参数自动选择 `?` 或 `&`，并对节目开始、结束时间进行编码。
+
+### 其他处理
+
+- 不使用旧版中不稳定的 webpack chunk 注入。
+- 保留节目列表、播放器初始化、加载状态和错误恢复逻辑。
+- 保留原生全屏、iOS 视频全屏和 CSS 全屏回退。
+- 移除本 Fork 脚本中的上游自动更新地址，防止修复版本被其他版本自动覆盖。
+
+## 常见问题
+
+### 控制台仍出现 `unload is not allowed`
+
+以下信息一般来自网站自身的 jQuery 或页面代码：
+
+```text
+Permissions policy violation: unload is not allowed in this document
+```
+
+这是新版 Chromium 对旧式 `unload` 事件的策略提示，通常不是视频播放失败的原因。
+
+### 控制台显示 WAF 403
+
+这不是 JSON 解析错误，也不是普通 CORS 错误，而是服务器已经拒绝请求。脚本只负责准确识别和报告，不会尝试规避服务端安全策略。
+
+### 页面仍在运行旧代码
+
+请检查 Tampermonkey 中脚本头部版本是否为：
+
+```text
+0.21.1
+```
+
+然后停用其他同名脚本，并重新打开页面。仅普通刷新可能保留旧页面建立的网络钩子。
+
+## 兼容性
+
+- 推荐使用最新版 Chrome、Edge 或 Firefox 配合 Tampermonkey。
+- Safari 可使用 Tampermonkey 或 [Userscripts App](https://apps.apple.com/app/userscripts/id1463198887)。
+- iOS/iPadOS 需要在 Safari 扩展设置中允许用户脚本访问 `kankanews.com`。
+- Violentmonkey 与 Tampermonkey 的跨域请求实现存在差异，本修复版优先针对 Tampermonkey 验证。
+
+## 安全边界
+
+- 脚本只声明连接 `kapi.kankanews.com`。
+- 脚本会读取看看新闻页面 `localStorage` 中的 `uuid`，作为 `M-Uuid` 发送回看看新闻 API。
+- 不读取 Cookie、密码、表单或剪贴板。
+- 不会把页面数据、节目地址或播放令牌发送给第三方服务。
+- 播放地址缓存只保存在当前页面内存中。
+
+## 致谢与上游
+
+- 原项目与主要功能实现：[`Popukok/smg_live`](https://github.com/Popukok/smg_live)
+- 本仓库用于提交兼容性修复并向上游发起 Pull Request。
+
+建议优先关注上游项目；如果修复被上游合并，请改用上游正式版本。
+
+## 免责声明
+
+本项目仅供学习、调试和兼容性研究。使用者应自行遵守网站服务条款、节目版权、地区授权及当地法律法规。项目维护者不提供内容、账号、网络代理或服务端访问权限。

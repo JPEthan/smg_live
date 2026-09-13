@@ -1,13 +1,11 @@
 // ==UserScript==
 // @name             收看SMGTV电视节目
 // @namespace        http://tampermonkey.net/
-// @version          0.20
-// @description      收看SMGTV，并解除页面部分限制
+// @version          0.21.1
+// @description      收看SMGTV，并解除页面部分限制（含 kapi 跨域请求修复）
 // @author           https://github.com/Popukok
 // @match            *://*.kankanews.com/huikan*
 // @icon             https://live.kankanews.com/favicon.ico
-// @updateURL        https://raw.githubusercontent.com/Popukok/smg_live/refs/heads/main/smg_fivestar.user.js
-// @downloadURL      https://raw.githubusercontent.com/Popukok/smg_live/refs/heads/main/smg_fivestar.user.js
 // @run-at           document-start
 // @grant            GM_xmlhttpRequest
 // @grant            unsafeWindow
@@ -430,7 +428,10 @@
                         'start=' + program.start_time + '&end=' + program.end_time;
                 } else if (isReplay && !hasStream && program?.start_time && program?.end_time) {
                     if (baseOk) {
-                        config.url = baseOk + '&start=' + program.start_time + '&end=' + program.end_time;
+                        const separator = baseOk.includes('?') ? '&' : '?';
+                        config.url = baseOk + separator +
+                            'start=' + encodeURIComponent(program.start_time) +
+                            '&end=' + encodeURIComponent(program.end_time);
                         console.log('[SMGTV] 已注入回放 频道' + channelId);
                     } else {
                         component.__smgNeedShiftBase = true;
@@ -1215,6 +1216,434 @@
         padding-top: env(safe-area-inset-top, 0px) !important;
     }
     `);
+    /*
+     * kapi.kankanews.com currently rejects the page's CORS preflight request.
+     * Route only that exact API origin through Tampermonkey's explicitly granted
+     * GM_xmlhttpRequest transport, while keeping the page-facing XHR/fetch shape.
+     */
+    const SMG_KAPI_ORIGIN = 'https://kapi.kankanews.com';
+    const smgNativeXhrOpen = UW.XMLHttpRequest.prototype.open;
+    const smgNativeXhrSend = UW.XMLHttpRequest.prototype.send;
+    const smgNativeXhrAbort = UW.XMLHttpRequest.prototype.abort;
+    const smgNativeSetRequestHeader = UW.XMLHttpRequest.prototype.setRequestHeader;
+    const smgNativeGetResponseHeader = UW.XMLHttpRequest.prototype.getResponseHeader;
+    const smgNativeGetAllResponseHeaders = UW.XMLHttpRequest.prototype.getAllResponseHeaders;
+    const smgNativeOverrideMimeType = UW.XMLHttpRequest.prototype.overrideMimeType;
+
+    function smgAbsoluteUrl(url) {
+        try {
+            return new URL(String(url), location.href).href;
+        } catch (e) {
+            return String(url);
+        }
+    }
+
+    function smgIsKapiRequest(url) {
+        try {
+            return new URL(smgAbsoluteUrl(url)).origin === SMG_KAPI_ORIGIN;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function smgSetHeader(headers, name, value) {
+        if (value == null || value === '') return;
+        const existingName = Object.keys(headers).find(key => key.toLowerCase() === name.toLowerCase());
+        if (existingName && existingName !== name) delete headers[existingName];
+        headers[name] = String(value);
+    }
+
+    function smgPrepareKapiHeaders(url, method, inputHeaders) {
+        const headers = Object.assign({}, inputHeaders || {});
+        smgSetHeader(headers, 'Accept', 'application/json, text/plain, */*');
+        try {
+            smgSetHeader(headers, 'User-Agent', UW.navigator?.userAgent || navigator.userAgent);
+        } catch (e) {}
+        try {
+            smgSetHeader(headers, 'Referer', location.href);
+            smgSetHeader(headers, 'Origin', location.origin);
+        } catch (e) {}
+        try {
+            smgSetHeader(headers, 'M-Uuid', LS.getItem('uuid') || '');
+        } catch (e) {}
+
+        if (String(method || 'GET').toUpperCase() === 'GET') {
+            try {
+                const parsedUrl = new URL(url);
+                const params = {};
+                parsedUrl.searchParams.forEach((value, name) => { params[name] = value; });
+                const signed = smgSignParams(params);
+                Object.keys(signed).forEach(name => smgSetHeader(headers, name, signed[name]));
+            } catch (e) {
+                throttleLog('sign-bridge-error', 5000, () => {
+                    console.warn('[SMGTV] kapi 请求重新签名失败:', shortUrl(url), e);
+                });
+            }
+        }
+        return headers;
+    }
+
+    function smgLooksLikeJson(rawText) {
+        return /^[\s\uFEFF]*(?:\{|\[)/.test(String(rawText || ''));
+    }
+
+    function smgWarnNonJson(url, status, finalUrl, contentType) {
+        const key = 'non-json-' + shortUrl(url);
+        throttleLog(key, 5000, () => {
+            console.warn('[SMGTV] 接口返回非 JSON，可能被 WAF 拦截', {
+                endpoint: shortUrl(url),
+                status: Number(status) || 0,
+                contentType: contentType || '',
+                finalUrl: finalUrl || url
+            });
+        });
+    }
+
+    function smgParseResponseHeaders(rawHeaders) {
+        const values = Object.create(null);
+        const pairs = [];
+        String(rawHeaders || '').split(/\r?\n/).forEach(line => {
+            const colon = line.indexOf(':');
+            if (colon <= 0) return;
+            const name = line.slice(0, colon).trim();
+            const value = line.slice(colon + 1).trim();
+            if (!name) return;
+            const lowerName = name.toLowerCase();
+            values[lowerName] = values[lowerName]
+                ? values[lowerName] + ', ' + value
+                : value;
+            pairs.push([name, value]);
+        });
+        return { raw: String(rawHeaders || ''), values: values, pairs: pairs };
+    }
+
+    function smgFireXhrEvent(xhr, type, progress) {
+        try {
+            const event = progress && typeof UW.ProgressEvent === 'function'
+                ? new UW.ProgressEvent(type, progress)
+                : new UW.Event(type);
+            xhr.dispatchEvent(event);
+        } catch (e) {
+            throttleLog('xhr-event-error', 5000, () => {
+                console.warn('[SMGTV] XHR 事件派发失败:', type, e);
+            });
+        }
+    }
+
+    function smgClearXhrBridge(xhr) {
+        [
+            'readyState', 'status', 'statusText', 'responseURL',
+            'responseText', 'response', 'responseXML', 'responseType'
+        ].forEach(name => {
+            try { delete xhr[name]; } catch (e) {}
+        });
+        xhr.__smgKapiBridge = null;
+    }
+
+    function smgCreateXhrBridge(xhr, method, url) {
+        const state = {
+            method: String(method || 'GET').toUpperCase(),
+            url: smgAbsoluteUrl(url),
+            headers: Object.create(null),
+            headerNames: Object.create(null),
+            responseHeaders: smgParseResponseHeaders(''),
+            readyState: 1,
+            status: 0,
+            statusText: '',
+            responseURL: '',
+            responseText: '',
+            response: null,
+            responseXML: null,
+            responseType: '',
+            request: null,
+            aborted: false,
+            completed: false
+        };
+        try {
+            [
+                'readyState', 'status', 'statusText', 'responseURL',
+                'responseText', 'response', 'responseXML'
+            ].forEach(name => {
+                Object.defineProperty(xhr, name, {
+                    configurable: true,
+                    enumerable: true,
+                    get: () => state[name]
+                });
+            });
+            Object.defineProperty(xhr, 'responseType', {
+                configurable: true,
+                enumerable: true,
+                get: () => state.responseType,
+                set: value => { state.responseType = value == null ? '' : String(value); }
+            });
+        } catch (e) {
+            smgClearXhrBridge(xhr);
+            console.warn('[SMGTV] 无法创建 kapi 跨域桥，退回浏览器请求:', e);
+            return null;
+        }
+        xhr.__smgKapiBridge = state;
+        return state;
+    }
+
+    function smgConvertXhrResponse(state, rawText) {
+        switch (state.responseType) {
+            case 'json':
+                try {
+                    return rawText ? JSON.parse(rawText) : null;
+                } catch (e) {
+                    return null;
+                }
+            case 'arraybuffer':
+                return new TextEncoder().encode(rawText).buffer;
+            case 'blob':
+                return new Blob([rawText], {
+                    type: state.responseHeaders.values['content-type'] || 'application/octet-stream'
+                });
+            case 'document':
+                try {
+                    const contentType = state.responseHeaders.values['content-type'] || '';
+                    const mimeType = /html/i.test(contentType) ? 'text/html' : 'application/xml';
+                    return new DOMParser().parseFromString(rawText, mimeType);
+                } catch (e) {
+                    return null;
+                }
+            default:
+                return rawText;
+        }
+    }
+
+    function smgFinishXhrError(xhr, state, type) {
+        if (!state || state.completed) return;
+        state.completed = true;
+        state.status = 0;
+        state.statusText = '';
+        state.readyState = 4;
+        smgFireXhrEvent(xhr, 'readystatechange');
+        smgFireXhrEvent(xhr, type);
+        smgFireXhrEvent(xhr, 'loadend');
+    }
+
+    function smgFinishXhrSuccess(xhr, state, gmResponse) {
+        if (!state || state.completed || state.aborted) return;
+        state.completed = true;
+        const rawText = typeof gmResponse.responseText === 'string'
+            ? gmResponse.responseText
+            : (typeof gmResponse.response === 'string' ? gmResponse.response : '');
+        state.status = Number(gmResponse.status) || 0;
+        state.statusText = gmResponse.statusText || '';
+        state.responseURL = gmResponse.finalUrl || state.url;
+        state.responseHeaders = smgParseResponseHeaders(gmResponse.responseHeaders);
+        state.responseText = rawText;
+        state.response = smgConvertXhrResponse(state, rawText);
+        state.responseXML = state.responseType === 'document' ? state.response : null;
+        if (!smgLooksLikeJson(rawText)) {
+            smgWarnNonJson(
+                state.url,
+                state.status,
+                state.responseURL,
+                state.responseHeaders.values['content-type']
+            );
+        }
+
+        state.readyState = 2;
+        smgFireXhrEvent(xhr, 'readystatechange');
+        state.readyState = 3;
+        smgFireXhrEvent(xhr, 'readystatechange');
+        smgFireXhrEvent(xhr, 'progress', {
+            lengthComputable: false,
+            loaded: rawText.length,
+            total: 0
+        });
+        state.readyState = 4;
+        smgFireXhrEvent(xhr, 'readystatechange');
+        smgFireXhrEvent(xhr, 'load', {
+            lengthComputable: false,
+            loaded: rawText.length,
+            total: 0
+        });
+        smgFireXhrEvent(xhr, 'loadend', {
+            lengthComputable: false,
+            loaded: rawText.length,
+            total: 0
+        });
+    }
+
+    UW.XMLHttpRequest.prototype.open = function(method, url, async) {
+        if (this.__smgKapiBridge) smgClearXhrBridge(this);
+        const requestUrl = smgAbsoluteUrl(url);
+        if (smgIsKapiRequest(requestUrl) && async !== false) {
+            const state = smgCreateXhrBridge(this, method, requestUrl);
+            if (state) {
+                smgFireXhrEvent(this, 'readystatechange');
+                return;
+            }
+        }
+        return smgNativeXhrOpen.apply(this, arguments);
+    };
+
+    UW.XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+        const state = this.__smgKapiBridge;
+        if (!state) return smgNativeSetRequestHeader.apply(this, arguments);
+        const actualName = String(name);
+        const lowerName = actualName.toLowerCase();
+        const actualValue = String(value);
+        state.headerNames[lowerName] = state.headerNames[lowerName] || actualName;
+        state.headers[lowerName] = state.headers[lowerName]
+            ? state.headers[lowerName] + ', ' + actualValue
+            : actualValue;
+    };
+
+    UW.XMLHttpRequest.prototype.getResponseHeader = function(name) {
+        const state = this.__smgKapiBridge;
+        if (!state) return smgNativeGetResponseHeader.apply(this, arguments);
+        if (state.readyState < 2) return null;
+        return state.responseHeaders.values[String(name).toLowerCase()] || null;
+    };
+
+    UW.XMLHttpRequest.prototype.getAllResponseHeaders = function() {
+        const state = this.__smgKapiBridge;
+        if (!state) return smgNativeGetAllResponseHeaders.apply(this, arguments);
+        return state.readyState < 2 ? '' : state.responseHeaders.raw;
+    };
+
+    UW.XMLHttpRequest.prototype.overrideMimeType = function(mimeType) {
+        const state = this.__smgKapiBridge;
+        if (!state) return smgNativeOverrideMimeType.apply(this, arguments);
+        state.overrideMimeType = String(mimeType || '');
+    };
+
+    UW.XMLHttpRequest.prototype.send = function(body) {
+        const state = this.__smgKapiBridge;
+        if (!state) return smgNativeXhrSend.apply(this, arguments);
+        if (state.request) {
+            throw new DOMException('The object is in an invalid state.', 'InvalidStateError');
+        }
+        const forwardedHeaders = {};
+        Object.keys(state.headers).forEach(lowerName => {
+            forwardedHeaders[state.headerNames[lowerName]] = state.headers[lowerName];
+        });
+        const headers = smgPrepareKapiHeaders(state.url, state.method, forwardedHeaders);
+        const details = {
+            method: state.method,
+            url: state.url,
+            headers: headers,
+            timeout: Number(this.timeout) || 15000,
+            onload: response => smgFinishXhrSuccess(this, state, response),
+            onerror: () => smgFinishXhrError(this, state, 'error'),
+            ontimeout: () => smgFinishXhrError(this, state, 'timeout'),
+            onabort: () => smgFinishXhrError(this, state, 'abort')
+        };
+        if (body != null) details.data = body;
+        smgFireXhrEvent(this, 'loadstart');
+        try {
+            state.request = GM_xmlhttpRequest(details);
+        } catch (e) {
+            console.error('[SMGTV] kapi 跨域请求失败:', e);
+            smgFinishXhrError(this, state, 'error');
+        }
+    };
+
+    UW.XMLHttpRequest.prototype.abort = function() {
+        const state = this.__smgKapiBridge;
+        if (!state) return smgNativeXhrAbort.apply(this, arguments);
+        if (state.completed) return;
+        state.aborted = true;
+        state.completed = true;
+        try { state.request?.abort?.(); } catch (e) {}
+        state.readyState = 0;
+        smgFireXhrEvent(this, 'abort');
+        smgFireXhrEvent(this, 'loadend');
+    };
+
+    function smgGmFetch(method, url, headers, body, anonymous) {
+        return new Promise((resolve, reject) => {
+            const details = {
+                method: method,
+                url: url,
+                headers: headers,
+                timeout: 15000,
+                anonymous: !!anonymous,
+                onload: resolve,
+                onerror: () => reject(new TypeError('kapi network request failed')),
+                ontimeout: () => reject(new TypeError('kapi network request timed out')),
+                onabort: () => reject(new DOMException('The operation was aborted.', 'AbortError'))
+            };
+            if (body != null) details.data = body;
+            try {
+                GM_xmlhttpRequest(details);
+            } catch (e) {
+                reject(e);
+            }
+        });
+    }
+
+    async function smgBridgeKapiFetch(input, init) {
+        init = init || {};
+        const isRequest = typeof UW.Request === 'function' && input instanceof UW.Request;
+        const requestUrl = smgAbsoluteUrl(isRequest ? input.url : input);
+        const method = String(init.method || (isRequest && input.method) || 'GET').toUpperCase();
+        const headerBag = new UW.Headers(isRequest ? input.headers : undefined);
+        if (init.headers) {
+            new UW.Headers(init.headers).forEach((value, name) => headerBag.set(name, value));
+        }
+        const forwardedHeaders = {};
+        headerBag.forEach((value, name) => { forwardedHeaders[name] = value; });
+        const headers = smgPrepareKapiHeaders(requestUrl, method, forwardedHeaders);
+        let body = init.body;
+        if (body == null && isRequest && method !== 'GET' && method !== 'HEAD') {
+            body = await input.clone().arrayBuffer();
+        }
+        const signal = init.signal || (isRequest && input.signal);
+        if (signal?.aborted) {
+            throw new DOMException('The operation was aborted.', 'AbortError');
+        }
+        const gmResponse = await smgGmFetch(
+            method,
+            requestUrl,
+            headers,
+            body,
+            (init.credentials || (isRequest && input.credentials)) === 'omit'
+        );
+        const rawText = typeof gmResponse.responseText === 'string'
+            ? gmResponse.responseText
+            : (typeof gmResponse.response === 'string' ? gmResponse.response : '');
+        const parsedHeaders = smgParseResponseHeaders(gmResponse.responseHeaders);
+        if (!smgLooksLikeJson(rawText)) {
+            smgWarnNonJson(
+                requestUrl,
+                gmResponse.status,
+                gmResponse.finalUrl,
+                parsedHeaders.values['content-type']
+            );
+        }
+        const responseHeaders = new UW.Headers();
+        parsedHeaders.pairs.forEach(([name, value]) => {
+            if (!/^(content-length|content-encoding)$/i.test(name)) {
+                try { responseHeaders.append(name, value); } catch (e) {}
+            }
+        });
+        const status = Number(gmResponse.status) || 502;
+        const bodyless = status === 204 || status === 205 || status === 304;
+        return new UW.Response(bodyless ? null : rawText, {
+            status: status,
+            statusText: gmResponse.statusText || '',
+            headers: responseHeaders
+        });
+    }
+
+    const smgNativeFetch = UW.fetch;
+    if (typeof smgNativeFetch === 'function') {
+        UW.fetch = function(input, init) {
+            const requestUrl = smgAbsoluteUrl(
+                typeof input === 'string' ? input : (input && input.url) || ''
+            );
+            if (smgIsKapiRequest(requestUrl)) {
+                return smgBridgeKapiFetch(input, init);
+            }
+            return smgNativeFetch.apply(this, arguments);
+        };
+    }
+
 const originalOpen = UW.XMLHttpRequest.prototype.open;
 function isTargetTVApi(url) {
     try {
@@ -1286,6 +1715,15 @@ UW.XMLHttpRequest.prototype.open = function(method, url) {
                         rawText = null;
                     }
                     if (typeof rawText === 'string' && rawText) {
+                        if (!smgLooksLikeJson(rawText)) {
+                            smgWarnNonJson(
+                                requestUrl,
+                                this.status,
+                                this.responseURL,
+                                this.getResponseHeader?.('content-type')
+                            );
+                            return;
+                        }
                         response = JSON.parse(rawText);
                     } else if (this.response && typeof this.response === 'object') {
                         response = this.response;
@@ -1318,6 +1756,15 @@ if (typeof originalFetch === 'function') {
             try {
                 return res.clone().text().then(raw => {
                     try {
+                        if (!smgLooksLikeJson(raw)) {
+                            smgWarnNonJson(
+                                requestUrl,
+                                res.status,
+                                res.url,
+                                res.headers?.get?.('content-type')
+                            );
+                            return res;
+                        }
                         const response = JSON.parse(raw);
                         if (!rewriteTvApiResponse(requestUrl, response)) {
                             return res;
