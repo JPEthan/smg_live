@@ -1,18 +1,22 @@
 // ==UserScript==
 // @name             收看SMGTV电视节目
 // @namespace        http://tampermonkey.net/
-// @version          0.18
+// @version          0.20
 // @description      收看SMGTV，并解除页面部分限制
 // @author           https://github.com/Popukok
 // @match            *://*.kankanews.com/huikan*
 // @icon             https://live.kankanews.com/favicon.ico
 // @updateURL        https://raw.githubusercontent.com/Popukok/smg_live/refs/heads/main/smg_fivestar.user.js
 // @downloadURL      https://raw.githubusercontent.com/Popukok/smg_live/refs/heads/main/smg_fivestar.user.js
-// @grant            none
 // @run-at           document-start
+// @grant            GM_xmlhttpRequest
+// @grant            unsafeWindow
+// @connect          kapi.kankanews.com
 // ==/UserScript==
 (function() {
     'use strict';
+    const UW = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+    const LS = (() => { try { return UW.localStorage || localStorage; } catch (e) { return localStorage; } })();
     const STYLE_ID = 'smgtv-unlock-style';
     const VIDEO_READY_CLASS = 'smgtv-video-ready';
     const FULLSCREEN_FALLBACK_CLASS = 'smgtv-fallback-fullscreen';
@@ -24,15 +28,14 @@
     const streamAddressCache = Object.create(null);
     const channelShiftBaseCache = Object.create(null);
     const channelLiveBaseCache = Object.create(null);
-    const LS_KEY_PREFIX = 'smgtv_shift_base_';
     const SMG_API_SECRET = '28c8edde3d61a0411511d3b1866f0636';
     const SMG_API_VERSION = '2.42.23';
     const SMG_PUBKEY = '-----BEGIN PUBLIC KEY-----\n' +
-        'MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDP5hzPUW5RFeE2xBT1ERB3hHZI\n' +
-        'Votn/qatWhgc1eZof09qKjElFN6Nma461ZAwGpX4aezKP8Adh4WJj4u2O54xCXDt\n' +
-        'wzKRqZO2oNZkuNmF2Va8kLgiEQAAcxYc8JgTN+uQQNpsep4n/o1sArTJooZIF17E\n' +
-        'tSqSgXDcJ7yDj5rc7wIDAQAB\n' +
-        '-----END PUBLIC KEY-----';
+          'MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDP5hzPUW5RFeE2xBT1ERB3hHZI\n' +
+          'Votn/qatWhgc1eZof09qKjElFN6Nma461ZAwGpX4aezKP8Adh4WJj4u2O54xCXDt\n' +
+          'wzKRqZO2oNZkuNmF2Va8kLgiEQAAcxYc8JgTN+uQQNpsep4n/o1sArTJooZIF17E\n' +
+          'tSqSgXDcJ7yDj5rc7wIDAQAB\n' +
+          '-----END PUBLIC KEY-----';
     function parseJwtExp(url) {
         try {
             const token = new URL(url).searchParams.get('token');
@@ -137,16 +140,65 @@
         merged.sign = smgMd5(smgMd5(s + SMG_API_SECRET));
         return merged;
     }
+    function shortUrl(url) { return url.split('kankanews.com')[1] || ''; }
+    function gmApiGet(url, headers) {
+        let gmHeaders = headers;
+        try {
+            const ua = (UW.navigator && UW.navigator.userAgent) || navigator.userAgent;
+            if (ua) gmHeaders = Object.assign({}, headers, { 'User-Agent': ua });
+        } catch (e) {}
+        return new Promise((resolve) => {
+            try {
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url: url,
+                    headers: gmHeaders,
+                    timeout: 15000,
+                    onload: function(response) {
+                        try {
+                            if (response.status !== 200) {
+                                console.warn('[SMGTV] GM接口异常 status=', response.status, shortUrl(url));
+                            }
+                            resolve(JSON.parse(response.responseText));
+                        } catch (e) {
+                            console.warn('[SMGTV] GM响应解析失败 status=', response.status, shortUrl(url));
+                            resolve(null);
+                        }
+                    },
+                    onerror: function() { console.warn('[SMGTV] GM请求失败', shortUrl(url)); resolve(null); },
+                    ontimeout: function() { console.warn('[SMGTV] GM请求超时', shortUrl(url)); resolve(null); }
+                });
+            } catch (e) {
+                console.warn('[SMGTV] GM调用异常', e);
+                resolve(null);
+            }
+        });
+    }
     function smgApiGet(path, params) {
         const signed = smgSignParams(params || {});
-        const q = Object.keys(params || {}).map(k =>
-            encodeURIComponent(k) + '=' + encodeURIComponent(params[k])).join('&');
+        const q = Object.keys(params || {}).map(k => encodeURIComponent(k) + '=' + encodeURIComponent(params[k])).join('&');
         const headers = { Accept: 'application/json, text/plain, */*' };
         Object.keys(signed).forEach(hk => { headers[hk] = signed[hk]; });
-        headers['M-Uuid'] = localStorage.getItem('uuid') || '';
-        return fetch('https://kapi.kankanews.com' + path + (q ? '?' + q : ''), { headers })
-            .then(r => r.json())
-            .catch(() => null);
+        headers['M-Uuid'] = LS.getItem('uuid') || '';
+        const url = 'https://kapi.kankanews.com' + path + (q ? '?' + q : '');
+        let pageFetch;
+        try {
+            pageFetch = UW.fetch(url, { headers: headers });
+        } catch (e) {
+            return gmApiGet(url, headers);
+        }
+        return pageFetch
+            .then(res => {
+                if (!res || !res.ok) {
+                    console.warn('[SMGTV] 接口异常 status=', res && res.status, shortUrl(url));
+                }
+                return res.text();
+            })
+            .then(txt => JSON.parse(txt))
+            .catch(e => {
+                console.warn('[SMGTV] 页面fetch失败, 转GM兜底:', shortUrl(url), e && e.message);
+                return gmApiGet(url, headers);
+            });
     }
     function hexToBase64(hexStr) {
         try {
@@ -165,9 +217,9 @@
             onReady(result);
         };
         const tryDecrypt = () => {
-            if (typeof JSEncrypt === 'undefined') return false;
+            if (typeof UW.JSEncrypt === 'undefined') return false;
             try {
-                const encrypt = new JSEncrypt();
+                const encrypt = new UW.JSEncrypt();
                 encrypt.setPublicKey(SMG_PUBKEY);
                 let hexStr;
                 try {
@@ -201,30 +253,10 @@
                 clearInterval(timer);
             } else if (tries > 50) {
                 clearInterval(timer);
+                console.warn('[SMGTV] RSA解密失败(JSEncrypt不可用或密文异常)');
                 finish('');
             }
         }, 200);
-    }
-    function loadPersistedShiftBase(channelId) {
-        try {
-            const raw = localStorage.getItem(LS_KEY_PREFIX + channelId);
-            if (!raw) return null;
-            const data = JSON.parse(raw);
-            if (data && data.url && typeof data.exp === 'number' && Date.now() < data.exp) {
-                return { url: data.url, exp: data.exp };
-            }
-            localStorage.removeItem(LS_KEY_PREFIX + channelId);
-        } catch (e) {
-            return null;
-        }
-        return null;
-    }
-    function savePersistedShiftBase(channelId, url) {
-        const exp = parseJwtExp(url);
-        if (exp == null) return;
-        try {
-            localStorage.setItem(LS_KEY_PREFIX + channelId, JSON.stringify({ url: url, exp: exp }));
-        } catch (e) {}
     }
     let fullscreenFallbackTarget = null;
     let cssFullscreenFallbackPlayer = null;
@@ -337,6 +369,27 @@
                 .replace(/\?$/, '');
         }
     }
+    function isMobileSite() {
+        try { return /^m\./.test(location.hostname); } catch (e) { return false; }
+    }
+    function getCompChannelId(component) {
+        if (!component) return null;
+        if (component.currChannel?.id != null) return component.currChannel.id;
+        if (component.currChannelDetail?.id != null) return component.currChannelDetail.id;
+        if (component.programDetail?.channel_info?.id != null) return component.programDetail.channel_info.id;
+        if (component.id != null && /^\d+$/.test(String(component.id))) return component.id;
+        if (component.programObj?.channel_id != null) return component.programObj.channel_id;
+        return null;
+    }
+    function resolveBaseOk(channelId) {
+        const now = Date.now();
+        if (channelId == null) return '';
+        const shiftEntry = channelShiftBaseCache[channelId];
+        if (shiftEntry && shiftEntry.exp > now) return shiftEntry.url;
+        const liveEntry = channelLiveBaseCache[channelId];
+        if (liveEntry && liveEntry.exp > now) return liveEntry.url;
+        return '';
+    }
     function installReplayUrlPatch(component) {
         const XGPlayer = component.$xgplayer;
         if (!XGPlayer || component.__smgReplayPatchInstalled) {
@@ -347,11 +400,8 @@
             construct(target, args) {
                 const config = args[0] || {};
                 const program = component.programObj;
-                const channelId = component.currChannel?.id != null ? component.currChannel.id :
-                    (component.programDetail?.channel_info?.id != null ? component.programDetail.channel_info.id :
-                        program?.channel_id);
+                const channelId = getCompChannelId(component);
                 let url = (config.url && typeof config.url === 'string') ? config.url : '';
-                const now = Date.now();
                 if (channelId != null && /\.m3u8/.test(url)) {
                     const base = stripTimeWindow(url);
                     if (base) {
@@ -362,31 +412,13 @@
                             store[channelId] = { url: base, exp: exp };
                         }
                         if (fromShift) {
-                            savePersistedShiftBase(channelId, base);
                             console.log('[SMGTV] 已抓取回看源');
                         } else {
                             console.log('[SMGTV] 已抓取直播源');
                         }
                     }
                 }
-                let baseOk = '';
-                if (channelId != null) {
-                    if (!(channelShiftBaseCache[channelId] && channelShiftBaseCache[channelId].exp > now)) {
-                        const persisted = loadPersistedShiftBase(channelId);
-                        if (persisted) {
-                            channelShiftBaseCache[channelId] = persisted;
-                        }
-                    }
-                    const shiftEntry = channelShiftBaseCache[channelId];
-                    if (shiftEntry && shiftEntry.exp > now) {
-                        baseOk = shiftEntry.url;
-                    } else {
-                        const liveEntry = channelLiveBaseCache[channelId];
-                        if (liveEntry && liveEntry.exp > now) {
-                            baseOk = liveEntry.url;
-                        }
-                    }
-                }
+                const baseOk = resolveBaseOk(channelId);
                 const isReplay = config.isLive === false;
                 const hasStream = /\.m3u8/.test(url);
                 const hasWindow = /\bstart=\d/.test(url);
@@ -415,6 +447,33 @@
             }
         });
     }
+    function wrapMobileInitPlayer(component) {
+        if (!isMobileSite()) return;
+        const original = component?.initPlayer;
+        if (!original || original.__smgMobileWrapped) return;
+        const wrapped = function (opts) {
+            if (opts && typeof opts === 'object' && 'url' in opts && !opts.url) {
+                const program = this?.programObj;
+                const channelId = getCompChannelId(this);
+                const base = resolveBaseOk(channelId);
+                if (base && program?.start_time && program?.end_time) {
+                    const isReplay = opts.isLive === false;
+                    if (isReplay) {
+                        opts.url = base + (base.includes('?') ? '&' : '?') +
+                            'start=' + program.start_time + '&end=' + program.end_time;
+                    } else {
+                        opts.url = base;
+                    }
+                    console.log('[SMGTV] 已注入' + (isReplay ? '回放' : '直播') + ' 频道' + channelId);
+                } else if (channelId != null) {
+                    component.__smgNeedShiftBase = true;
+                }
+            }
+            return original.apply(this, arguments);
+        };
+        wrapped.__smgMobileWrapped = true;
+        component.initPlayer = wrapped;
+    }
     function dateStrOffset(daysAgo) {
         const d = new Date(Date.now() - daysAgo * 86400000);
         return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
@@ -439,7 +498,7 @@
     function findDonorIdFromList(list) {
         if (!Array.isArray(list)) return null;
         const news = list.find(p => p && p.is_review === 1 && p.id &&
-            typeof p.name === 'string' && p.name.indexOf('体育新闻') !== -1);
+                               typeof p.name === 'string' && p.name.indexOf('体育新闻') !== -1);
         if (news) return news.id;
         const any = list.find(p => p && p.is_review === 1 && p.id);
         return any ? any.id : null;
@@ -447,28 +506,27 @@
     function fetchShiftByDonor(channelId, donorId) {
         return smgApiGet('/content/pc/tv/program/detail', { channel_program_id: donorId })
             .then(res => {
-                const detail = res && res.result;
-                const enc = detail && detail.channel_info && detail.channel_info.shift_address;
-                if (!enc) return null;
-                return new Promise(resolve => {
-                    decryptRsaChunks(enc, url => {
-                        if (!url) return resolve(null);
-                        try {
-                            const u = new URL(url);
-                            u.searchParams.delete('start');
-                            u.searchParams.delete('end');
-                            const base = u.toString();
-                            const exp = parseJwtExp(url);
-                            channelShiftBaseCache[channelId] = { url: base, exp: exp || (Date.now() + 12 * 3600 * 1000) };
-                            savePersistedShiftBase(channelId, base);
-                            console.log('[SMGTV] 已获取回看源');
-                            resolve(base);
-                        } catch (e) {
-                            resolve(null);
-                        }
-                    });
+            const detail = res && res.result;
+            const enc = detail && detail.channel_info && detail.channel_info.shift_address;
+            if (!enc) return null;
+            return new Promise(resolve => {
+                decryptRsaChunks(enc, url => {
+                    if (!url) return resolve(null);
+                    try {
+                        const u = new URL(url);
+                        u.searchParams.delete('start');
+                        u.searchParams.delete('end');
+                        const base = u.toString();
+                        const exp = parseJwtExp(url);
+                        channelShiftBaseCache[channelId] = { url: base, exp: exp || (Date.now() + 12 * 3600 * 1000) };
+                        console.log('[SMGTV] 已获取回看源');
+                        resolve(base);
+                    } catch (e) {
+                        resolve(null);
+                    }
                 });
             });
+        });
     }
     function acquireShiftBase(channelId, component) {
         let candidate;
@@ -493,31 +551,25 @@
         }
         return smgApiGet('/content/pc/tv/programs', { channel_id: channelId, date: dateStrOffset(daysAgo) })
             .then(res => {
-                const id = findDonorIdFromList(res && res.result && res.result.programs);
-                if (!id) return scanPast(channelId, daysAgo + 1);
-                return fetchShiftByDonor(channelId, id).then(url => {
-                    if (url) return url;
-                    return scanPast(channelId, daysAgo + 1);
-                });
+            const id = findDonorIdFromList(res && res.result && res.result.programs);
+            if (!id) return scanPast(channelId, daysAgo + 1);
+            return fetchShiftByDonor(channelId, id).then(url => {
+                if (url) return url;
+                return scanPast(channelId, daysAgo + 1);
             });
+        });
     }
     function maybeAutoCaptureShift(component, fromMonitor) {
         if (!component || !component.__smgPatched || !component.__smgNeedShiftBase || !fromMonitor) {
             return;
         }
-        const chId = component.currChannel?.id;
+        const chId = getCompChannelId(component);
         if (chId == null) {
             return;
         }
         const now = Date.now();
-        if (!(channelShiftBaseCache[chId] && channelShiftBaseCache[chId].exp > now)) {
-            const persisted = loadPersistedShiftBase(chId);
-            if (persisted) {
-                channelShiftBaseCache[chId] = persisted;
-            }
-        }
         const hasBase = !!(channelShiftBaseCache[chId] && channelShiftBaseCache[chId].exp > now) ||
-            !!(channelLiveBaseCache[chId] && channelLiveBaseCache[chId].exp > now);
+              !!(channelLiveBaseCache[chId] && channelLiveBaseCache[chId].exp > now);
         if (hasBase) {
             component.__smgNeedShiftBase = false;
             return;
@@ -526,7 +578,6 @@
             component.__smgNeedShiftBase = false;
             return;
         }
-        // 冷却：一次获取尝试后 60s 内不重复，避免心跳空转
         const cooldownKey = '__smgShiftCooldown';
         if (now - (component[cooldownKey] || 0) < 60000) {
             return;
@@ -541,12 +592,15 @@
             if (ok) {
                 component.__smgNeedShiftBase = false;
                 component.__smgAcquireFails = 0;
-                // shift 基底已就绪：重载当前节目，让 Proxy 注入生效(之前空 url 播放器已失败)
                 if (component && typeof component.initPlayer === 'function') {
-                    component.initPlayer({ changeCurrentList: false, isPlay: true, trigger: 'click' });
+                    if (isMobileSite()) {
+                        const prog = component.programObj;
+                        component.initPlayer({ url: '', isLive: !!(prog && prog.play === 1), autoplay: true });
+                    } else {
+                        component.initPlayer({ changeCurrentList: false, isPlay: true, trigger: 'click' });
+                    }
                 }
             } else {
-                // 连续失败：拉长冷却避免反复请求；needShift 保留，用户换台/重试会重置
                 component.__smgAcquireFails = (component.__smgAcquireFails || 0) + 1;
                 if (component.__smgAcquireFails >= 3) {
                     component[cooldownKey] = now + 10 * 60 * 1000;
@@ -566,7 +620,7 @@
         }
         ensurePlayableStream(component);
         const hasLive = !!(component.programDetail?.channel_info?.live_address ||
-            component.currChannelDetail?.live_address);
+                           component.currChannelDetail?.live_address);
         if (!hasLive) {
             if (component.__smgNeedShiftBase) {
                 component.__smgRecovering = true;
@@ -764,11 +818,11 @@
             return Promise.reject(new Error('missing fullscreen target'));
         }
         const request =
-            el.requestFullscreen ||
-            el.webkitRequestFullscreen ||
-            el.webkitRequestFullScreen ||
-            el.mozRequestFullScreen ||
-            el.msRequestFullscreen;
+              el.requestFullscreen ||
+              el.webkitRequestFullscreen ||
+              el.webkitRequestFullScreen ||
+              el.mozRequestFullScreen ||
+              el.msRequestFullscreen;
         if (!request) {
             return Promise.reject(new Error('fullscreen api unavailable'));
         }
@@ -781,11 +835,11 @@
     }
     function exitBrowserFullscreen() {
         const exit =
-            document.exitFullscreen ||
-            document.webkitExitFullscreen ||
-            document.webkitCancelFullScreen ||
-            document.mozCancelFullScreen ||
-            document.msExitFullscreen;
+              document.exitFullscreen ||
+              document.webkitExitFullscreen ||
+              document.webkitCancelFullScreen ||
+              document.mozCancelFullScreen ||
+              document.msExitFullscreen;
         if (!exit) {
             return Promise.resolve();
         }
@@ -877,16 +931,16 @@
         const player = component?.player;
         const enterNative = callFullscreenMethod(() => (
             player && typeof player.getFullscreen === 'function' ?
-                player.getFullscreen(target) :
-                requestElementFullscreen(target)
+            player.getFullscreen(target) :
+            requestElementFullscreen(target)
         ));
         Promise.resolve(enterNative)
             .then(() => syncFullscreenButtonState(component, true))
             .catch(() => {
-                if (!enterNativeVideoFullscreen(component)) {
-                    enterFallbackFullscreen(target, component);
-                }
-            });
+            if (!enterNativeVideoFullscreen(component)) {
+                enterFallbackFullscreen(target, component);
+            }
+        });
     }
     function exitFullscreen(component) {
         const player = component?.player;
@@ -896,15 +950,15 @@
         }
         const exitNative = callFullscreenMethod(() => (
             player && typeof player.exitFullscreen === 'function' ?
-                player.exitFullscreen() :
-                exitBrowserFullscreen()
+            player.exitFullscreen() :
+            exitBrowserFullscreen()
         ));
         Promise.resolve(exitNative)
             .catch(exitBrowserFullscreen)
             .then(
-                () => syncFullscreenButtonState(component, false),
-                () => syncFullscreenButtonState(component, false)
-            );
+            () => syncFullscreenButtonState(component, false),
+            () => syncFullscreenButtonState(component, false)
+        );
     }
     function handleFullscreenControl(event) {
         const button = event.target?.closest?.(FULLSCREEN_BUTTON_SELECTOR);
@@ -1023,13 +1077,14 @@
             document.addEventListener('visibilitychange', component.pageVisibilityChange);
         }
         if (component._handlerUnload) {
-            window.removeEventListener('unload', component._handlerUnload);
+            UW.removeEventListener('unload', component._handlerUnload);
             component._handlerUnload = null;
         }
         ['initPlayer', 'initNoProgramPlayer', 'initPadPlayer', 'changeProgram', 'changeChannel', 'getProgramDetail'].forEach(methodName => {
             wrapComponentMethod(component, methodName, syncLoadingState);
         });
         installReplayUrlPatch(component);
+        wrapMobileInitPlayer(component);
         ensurePlayableStream(component);
         const handleProgramList = component.handleProgramList;
         if (typeof handleProgramList === 'function' && !handleProgramList.__smgWrapped) {
@@ -1160,131 +1215,131 @@
         padding-top: env(safe-area-inset-top, 0px) !important;
     }
     `);
-    const originalOpen = XMLHttpRequest.prototype.open;
-    function isTargetTVApi(url) {
-        try {
-            return new URL(String(url), location.href).pathname.includes('/content/pc/tv/');
-        } catch (e) {
-            return String(url).includes('/content/pc/tv/');
-        }
+const originalOpen = UW.XMLHttpRequest.prototype.open;
+function isTargetTVApi(url) {
+    try {
+        return new URL(String(url), location.href).pathname.includes('/content/pc/tv/');
+    } catch (e) {
+        return String(url).includes('/content/pc/tv/');
     }
-    function rewriteTvApiResponse(requestUrl, response) {
-        let modified = false;
-        if (!response || typeof response !== 'object') {
-            return false;
-        }
-        if (requestUrl.includes('/channel/detail') && response.result) {
-            rememberStreamAddresses(
-                response.result.id,
-                response.result.live_address,
-                response.result.shift_address
-            );
-        }
-        if (requestUrl.includes('/program/detail') && response.result) {
-            forceOpenProgram(response.result);
-            const channelInfo = response.result.channel_info || (response.result.channel_info = {});
-            forceOpenProgram(channelInfo);
-            const channelId = getResultChannelId(response.result);
-            fillStreamAddresses(channelInfo, channelId);
+}
+function rewriteTvApiResponse(requestUrl, response) {
+    let modified = false;
+    if (!response || typeof response !== 'object') {
+        return false;
+    }
+    if (requestUrl.includes('/channel/detail') && response.result) {
+        rememberStreamAddresses(
+            response.result.id,
+            response.result.live_address,
+            response.result.shift_address
+        );
+    }
+    if (requestUrl.includes('/program/detail') && response.result) {
+        forceOpenProgram(response.result);
+        const channelInfo = response.result.channel_info || (response.result.channel_info = {});
+        forceOpenProgram(channelInfo);
+        const channelId = getResultChannelId(response.result);
+        fillStreamAddresses(channelInfo, channelId);
+        modified = true;
+    }
+    if (requestUrl.includes('/programs') && response.result?.programs) {
+        response.result.programs.forEach(program => {
+            forceOpenProgram(program);
             modified = true;
-        }
-        if (requestUrl.includes('/programs') && response.result?.programs) {
-            response.result.programs.forEach(program => {
-                forceOpenProgram(program);
-                modified = true;
-            });
-        }
-        return modified;
+        });
     }
-    function replaceXhrResponse(xhr, body) {
-        try {
-            Object.defineProperty(xhr, 'responseText', {
-                value: body,
-                writable: false,
-                configurable: true
-            });
-            Object.defineProperty(xhr, 'response', {
-                value: xhr.responseType === 'json' ? JSON.parse(body) : body,
-                writable: false,
-                configurable: true
-            });
-        } catch (e) {
-            throttleLog('rewrite-error', 5000, () => console.error('[SMGTV] 重写接口响应失败:', e));
-        }
+    return modified;
+}
+function replaceXhrResponse(xhr, body) {
+    try {
+        Object.defineProperty(xhr, 'responseText', {
+            value: body,
+            writable: false,
+            configurable: true
+        });
+        Object.defineProperty(xhr, 'response', {
+            value: xhr.responseType === 'json' ? JSON.parse(body) : body,
+            writable: false,
+            configurable: true
+        });
+    } catch (e) {
+        throttleLog('rewrite-error', 5000, () => console.error('[SMGTV] 重写接口响应失败:', e));
     }
-    XMLHttpRequest.prototype.open = function(method, url) {
-        this.__smgRequestUrl = String(url);
-        if (isTargetTVApi(this.__smgRequestUrl)) {
-            if (!this.__smgHooked) {
-                this.__smgHooked = true;
-                this.addEventListener('readystatechange', function() {
-                    if (this.readyState !== 4) {
+}
+UW.XMLHttpRequest.prototype.open = function(method, url) {
+    this.__smgRequestUrl = String(url);
+    if (isTargetTVApi(this.__smgRequestUrl)) {
+        if (!this.__smgHooked) {
+            this.__smgHooked = true;
+            this.addEventListener('readystatechange', function() {
+                if (this.readyState !== 4) {
+                    return;
+                }
+                const requestUrl = this.__smgRequestUrl;
+                try {
+                    let response;
+                    let rawText = null;
+                    try {
+                        rawText = this.responseText;
+                    } catch (e) {
+                        rawText = null;
+                    }
+                    if (typeof rawText === 'string' && rawText) {
+                        response = JSON.parse(rawText);
+                    } else if (this.response && typeof this.response === 'object') {
+                        response = this.response;
+                    } else {
                         return;
                     }
-                    const requestUrl = this.__smgRequestUrl;
-                    try {
-                        let response;
-                        let rawText = null;
-                        try {
-                            rawText = this.responseText;
-                        } catch (e) {
-                            rawText = null;
-                        }
-                        if (typeof rawText === 'string' && rawText) {
-                            response = JSON.parse(rawText);
-                        } else if (this.response && typeof this.response === 'object') {
-                            response = this.response;
-                        } else {
-                            return;
-                        }
-                        if (rewriteTvApiResponse(requestUrl, response)) {
-                            replaceXhrResponse(this, JSON.stringify(response));
-                        }
-                    } catch (e) {
-                        throttleLog('parse-error', 5000, () => console.error('[SMGTV] 解析接口响应失败:', e));
+                    if (rewriteTvApiResponse(requestUrl, response)) {
+                        replaceXhrResponse(this, JSON.stringify(response));
                     }
-                });
-            }
-        }
-        return originalOpen.apply(this, arguments);
-    };
-    const originalFetch = window.fetch;
-    if (typeof originalFetch === 'function') {
-        window.fetch = function(input, init) {
-            const requestUrl = String(typeof input === 'string' ? input : (input && input.url) || '');
-            const request = originalFetch.apply(this, arguments);
-            if (!isTargetTVApi(requestUrl)) {
-                return request;
-            }
-            return request.then(res => {
-                if (!res) {
-                    return res;
-                }
-                try {
-                    return res.clone().text().then(raw => {
-                        try {
-                            const response = JSON.parse(raw);
-                            if (!rewriteTvApiResponse(requestUrl, response)) {
-                                return res;
-                            }
-                            return new Response(JSON.stringify(response), {
-                                status: res.status,
-                                statusText: res.statusText,
-                                headers: res.headers
-                            });
-                        } catch (e) {
-                            throttleLog('parse-error', 5000, () => console.error('[SMGTV] 解析接口响应失败:', e));
-                            return res;
-                        }
-                    }).catch(() => res);
                 } catch (e) {
-                    throttleLog('rewrite-error', 5000, () => console.error('[SMGTV] 重写接口响应失败:', e));
-                    return res;
+                    throttleLog('parse-error', 5000, () => console.error('[SMGTV] 解析接口响应失败:', e));
                 }
             });
-        };
+        }
     }
-    ensureViewportFitCover();
-    initComponentPatch();
-    initFullscreenPatch();
+    return originalOpen.apply(this, arguments);
+};
+const originalFetch = UW.fetch;
+if (typeof originalFetch === 'function') {
+    UW.fetch = function(input, init) {
+        const requestUrl = String(typeof input === 'string' ? input : (input && input.url) || '');
+        const request = originalFetch.apply(this, arguments);
+        if (!isTargetTVApi(requestUrl)) {
+            return request;
+        }
+        return request.then(res => {
+            if (!res) {
+                return res;
+            }
+            try {
+                return res.clone().text().then(raw => {
+                    try {
+                        const response = JSON.parse(raw);
+                        if (!rewriteTvApiResponse(requestUrl, response)) {
+                            return res;
+                        }
+                        return new UW.Response(JSON.stringify(response), {
+                            status: res.status,
+                            statusText: res.statusText,
+                            headers: res.headers
+                        });
+                    } catch (e) {
+                        throttleLog('parse-error', 5000, () => console.error('[SMGTV] 解析接口响应失败:', e));
+                        return res;
+                    }
+                }).catch(() => res);
+            } catch (e) {
+                throttleLog('rewrite-error', 5000, () => console.error('[SMGTV] 重写接口响应失败:', e));
+                return res;
+            }
+        });
+    };
+}
+ensureViewportFitCover();
+initComponentPatch();
+initFullscreenPatch();
 })();
