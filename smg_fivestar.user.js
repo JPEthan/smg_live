@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name             收看SMGTV电视节目
 // @namespace        http://tampermonkey.net/
-// @version          0.21.1
-// @description      收看SMGTV，并解除页面部分限制（含 kapi 跨域请求修复）
+// @version          0.21.3
+// @description      收看SMGTV，并解除页面部分限制（含播放令牌自动更新与受控刷新）
 // @author           https://github.com/Popukok
 // @match            *://*.kankanews.com/huikan*
 // @icon             https://live.kankanews.com/favicon.ico
@@ -26,6 +26,12 @@
     const streamAddressCache = Object.create(null);
     const channelShiftBaseCache = Object.create(null);
     const channelLiveBaseCache = Object.create(null);
+    const streamRefreshState = Object.create(null);
+    const STREAM_REFRESH_LEEWAY_MS = 90 * 1000;
+    const STREAM_REFRESH_COOLDOWN_MS = 15 * 1000;
+    const STREAM_REFRESH_TIMEOUT_MS = 12 * 1000;
+    const AUTO_RELOAD_COOLDOWN_MS = 2 * 60 * 1000;
+    const AUTO_RELOAD_STORAGE_KEY = 'smgtv-auto-reload-at';
     const SMG_API_SECRET = '28c8edde3d61a0411511d3b1866f0636';
     const SMG_API_VERSION = '2.42.23';
     const SMG_PUBKEY = '-----BEGIN PUBLIC KEY-----\n' +
@@ -388,6 +394,189 @@
         if (liveEntry && liveEntry.exp > now) return liveEntry.url;
         return '';
     }
+    function isSmgPlaybackManifest(url) {
+        try {
+            const parsed = new URL(String(url), location.href);
+            return /(^|\.)kksmg\.com$/i.test(parsed.hostname) && /\.m3u8$/i.test(parsed.pathname);
+        } catch (e) {
+            return false;
+        }
+    }
+    function getStreamRefreshEntry(channelId) {
+        const key = String(channelId);
+        return streamRefreshState[key] || (streamRefreshState[key] = {
+            timer: null,
+            promise: null,
+            lastAttemptAt: 0,
+            lastForbiddenAt: 0,
+            reloadScheduled: false
+        });
+    }
+    function scheduleStreamRefresh(channelId, exp) {
+        if (channelId == null || !Number.isFinite(exp)) return;
+        const entry = getStreamRefreshEntry(channelId);
+        if (entry.timer) clearTimeout(entry.timer);
+        const delay = Math.max(5000, exp - Date.now() - STREAM_REFRESH_LEEWAY_MS);
+        entry.timer = setTimeout(() => {
+            entry.timer = null;
+            const component = findTVComponent();
+            if (String(getCompChannelId(component)) === String(channelId)) {
+                refreshPlaybackToken(component, '令牌即将到期');
+            }
+        }, Math.min(delay, 0x7fffffff));
+    }
+    function rememberDecryptedStream(channelId, url, isReplay) {
+        const base = stripTimeWindow(url || '');
+        if (channelId == null || !base || !/\.m3u8(?:$|[?#])/i.test(base)) return '';
+        const exp = parseJwtExp(base) || (Date.now() + 12 * 3600 * 1000);
+        const store = isReplay ? channelShiftBaseCache : channelLiveBaseCache;
+        store[channelId] = { url: base, exp: exp };
+        scheduleStreamRefresh(channelId, exp);
+        return base;
+    }
+    function decryptStreamAddress(encryptedAddress) {
+        return new Promise(resolve => {
+            if (!encryptedAddress) return resolve('');
+            if (/^https?:\/\//i.test(encryptedAddress)) return resolve(encryptedAddress);
+            decryptRsaChunks(encryptedAddress, url => resolve(url || ''));
+        });
+    }
+    async function fetchFreshStreamBase(channelId, component, isReplay) {
+        const response = await smgApiGet('/content/pc/tv/channel/detail', { channel_id: channelId });
+        const detail = response && response.result;
+        if (!detail) return '';
+        rememberStreamAddresses(channelId, detail.live_address, detail.shift_address);
+        if (component?.currChannelDetail) {
+            if (detail.live_address) component.currChannelDetail.live_address = detail.live_address;
+            if (detail.shift_address) component.currChannelDetail.shift_address = detail.shift_address;
+        }
+        const channelInfo = component?.programDetail?.channel_info;
+        if (channelInfo) {
+            if (detail.live_address) channelInfo.live_address = detail.live_address;
+            if (detail.shift_address) channelInfo.shift_address = detail.shift_address;
+        }
+        const encrypted = isReplay
+            ? (detail.shift_address || detail.live_address)
+            : (detail.live_address || detail.shift_address);
+        const freshUrl = await decryptStreamAddress(encrypted);
+        return rememberDecryptedStream(channelId, freshUrl, isReplay);
+    }
+    function restoreReplayPosition(component, position, shouldResume) {
+        if (!(position > 1)) return;
+        let attempts = 0;
+        const timer = setInterval(() => {
+            attempts += 1;
+            const video = getPlayerVideo(component);
+            if (video && video.readyState >= 1) {
+                try {
+                    video.currentTime = position;
+                    if (shouldResume) video.play().catch(() => {});
+                    clearInterval(timer);
+                    console.log('[SMGTV] 已恢复回看进度');
+                } catch (e) {}
+            }
+            if (attempts >= 20) clearInterval(timer);
+        }, 250);
+    }
+    function scheduleControlledReload(component, reason) {
+        const channelId = getCompChannelId(component);
+        if (channelId == null) return false;
+        const entry = getStreamRefreshEntry(channelId);
+        if (entry.reloadScheduled) return true;
+        const isReplay = component.player?.config?.isLive === false || component.programObj?.play === 0;
+        if (isReplay) {
+            console.warn('[SMGTV] 回看地址更新失败，请刷新页面后重新选择节目');
+            return false;
+        }
+        let lastReloadAt = 0;
+        try { lastReloadAt = Number(UW.sessionStorage.getItem(AUTO_RELOAD_STORAGE_KEY)) || 0; } catch (e) {}
+        if (Date.now() - lastReloadAt < AUTO_RELOAD_COOLDOWN_MS) {
+            console.warn('[SMGTV] 已执行过自动刷新，仍失败时请检查网络或稍后重试');
+            return false;
+        }
+        entry.reloadScheduled = true;
+        try { UW.sessionStorage.setItem(AUTO_RELOAD_STORAGE_KEY, String(Date.now())); } catch (e) {}
+        console.warn('[SMGTV] 无法在线更新播放地址，2 秒后自动刷新页面：' + reason);
+        setTimeout(() => UW.location.reload(), 2000);
+        return true;
+    }
+    function verifyRefreshStayedHealthy(component, channelId, successAt) {
+        setTimeout(() => {
+            const entry = getStreamRefreshEntry(channelId);
+            if (entry.lastForbiddenAt > successAt + 3000) {
+                scheduleControlledReload(component, '更新后媒体服务器仍返回 403');
+            }
+        }, 8000);
+    }
+    function refreshPlaybackToken(component, reason, failedUrl) {
+        if (!component || typeof component.initPlayer !== 'function') return Promise.resolve(false);
+        const channelId = getCompChannelId(component);
+        if (channelId == null) return Promise.resolve(false);
+        const entry = getStreamRefreshEntry(channelId);
+        if (entry.promise) return entry.promise;
+        const now = Date.now();
+        if (now - entry.lastAttemptAt < STREAM_REFRESH_COOLDOWN_MS) return Promise.resolve(false);
+        entry.lastAttemptAt = now;
+        const video = getPlayerVideo(component);
+        const resumeAt = Number(video?.currentTime) || 0;
+        const shouldResume = !!video && !video.paused;
+        const isReplay = component.player?.config?.isLive === false || component.programObj?.play === 0;
+        delete channelLiveBaseCache[channelId];
+        delete channelShiftBaseCache[channelId];
+        let timeoutId;
+        const timeout = new Promise(resolve => {
+            timeoutId = setTimeout(() => resolve(''), STREAM_REFRESH_TIMEOUT_MS);
+        });
+        entry.promise = Promise.race([
+            fetchFreshStreamBase(channelId, component, isReplay),
+            timeout
+        ]).then(base => {
+            if (base && failedUrl && stripTimeWindow(base) === stripTimeWindow(failedUrl)) {
+                console.warn('[SMGTV] 服务端仍返回同一个失效播放地址');
+                base = '';
+            }
+            if (!base) {
+                console.warn('[SMGTV] 播放地址更新失败，请稍后重试');
+                if (failedUrl) scheduleControlledReload(component, '未取得新的播放地址');
+                return false;
+            }
+            component.__smgNeedShiftBase = false;
+            component.__smgRecoverCount = 0;
+            component.__smgForcedStreamBase = base;
+            component.initPlayer({
+                changeCurrentList: false,
+                isPlay: shouldResume,
+                autoplay: shouldResume,
+                trigger: 'auto'
+            });
+            if (isReplay) restoreReplayPosition(component, resumeAt, shouldResume);
+            console.log('[SMGTV] 已更新播放令牌：' + reason);
+            if (failedUrl) verifyRefreshStayedHealthy(component, channelId, Date.now());
+            return true;
+        }).catch(error => {
+            console.warn('[SMGTV] 播放地址更新异常:', error && error.message);
+            if (failedUrl) scheduleControlledReload(component, '播放地址更新异常');
+            return false;
+        }).finally(() => {
+            clearTimeout(timeoutId);
+            entry.promise = null;
+        });
+        return entry.promise;
+    }
+    function handlePlaybackForbidden(url, status) {
+        if ((status !== 401 && status !== 403) || !isSmgPlaybackManifest(url)) return;
+        throttleLog('playback-forbidden', 10000, () => {
+            console.warn('[SMGTV] 播放地址已失效，正在自动更新 status=' + status);
+        });
+        const component = findTVComponent();
+        if (component) {
+            const channelId = getCompChannelId(component);
+            if (channelId == null) return;
+            const entry = getStreamRefreshEntry(channelId);
+            entry.lastForbiddenAt = Date.now();
+            refreshPlaybackToken(component, '媒体服务器返回 ' + status, url);
+        }
+    }
     function installReplayUrlPatch(component) {
         const XGPlayer = component.$xgplayer;
         if (!XGPlayer || component.__smgReplayPatchInstalled) {
@@ -400,14 +589,22 @@
                 const program = component.programObj;
                 const channelId = getCompChannelId(component);
                 let url = (config.url && typeof config.url === 'string') ? config.url : '';
+                const isReplay = config.isLive === false;
+                const forcedBase = component.__smgForcedStreamBase;
+                if (forcedBase) {
+                    url = forcedBase;
+                    config.url = forcedBase;
+                    component.__smgForcedStreamBase = '';
+                }
                 if (channelId != null && /\.m3u8/.test(url)) {
                     const base = stripTimeWindow(url);
                     if (base) {
-                        const fromShift = /[?&]start=\d+/.test(url);
+                        const fromShift = isReplay || /[?&]start=\d+/.test(url);
                         const store = fromShift ? channelShiftBaseCache : channelLiveBaseCache;
                         const exp = parseJwtExp(url);
                         if (exp != null) {
                             store[channelId] = { url: base, exp: exp };
+                            scheduleStreamRefresh(channelId, exp);
                         }
                         if (fromShift) {
                             console.log('[SMGTV] 已抓取回看源');
@@ -417,9 +614,13 @@
                     }
                 }
                 const baseOk = resolveBaseOk(channelId);
-                const isReplay = config.isLive === false;
                 const hasStream = /\.m3u8/.test(url);
                 const hasWindow = /\bstart=\d/.test(url);
+                const currentExp = hasStream ? parseJwtExp(url) : null;
+                if (hasStream && currentExp != null && currentExp <= Date.now() + STREAM_REFRESH_LEEWAY_MS && baseOk) {
+                    url = baseOk;
+                    config.url = baseOk;
+                }
                 if (isReplay && hasWindow) {
                     return new target(...args);
                 }
@@ -520,6 +721,7 @@
                         const base = u.toString();
                         const exp = parseJwtExp(url);
                         channelShiftBaseCache[channelId] = { url: base, exp: exp || (Date.now() + 12 * 3600 * 1000) };
+                        scheduleStreamRefresh(channelId, channelShiftBaseCache[channelId].exp);
                         console.log('[SMGTV] 已获取回看源');
                         resolve(base);
                     } catch (e) {
@@ -1640,7 +1842,12 @@
             if (smgIsKapiRequest(requestUrl)) {
                 return smgBridgeKapiFetch(input, init);
             }
-            return smgNativeFetch.apply(this, arguments);
+            const request = smgNativeFetch.apply(this, arguments);
+            if (!isSmgPlaybackManifest(requestUrl)) return request;
+            return request.then(response => {
+                handlePlaybackForbidden(requestUrl, response && response.status);
+                return response;
+            });
         };
     }
 
